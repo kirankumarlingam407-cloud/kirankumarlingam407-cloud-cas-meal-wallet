@@ -18,12 +18,16 @@ import {
   getStalls,
   createStall,
   deleteStall,
+  regenerateStallCode,
+  toggleStallCodeActive,
+  getScanAttempts,
   getVendorAccounts,
   createVendorAccount,
   deleteVendorAccount,
   storeEvents 
 } from '@/lib/store';
-import { Settings, Person, Transaction, Flag, MealSlot, DailyBillingRow, RosterUploadHistory, Stall, VendorAccount, VendorAccountRole } from '@/types';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
+import { Settings, Person, Transaction, Flag, MealSlot, DailyBillingRow, RosterUploadHistory, Stall, VendorAccount, VendorAccountRole, ScanAttempt } from '@/types';
 import { 
   ShieldCheck, 
   BarChart3, 
@@ -40,11 +44,15 @@ import {
   ExternalLink, 
   FileSpreadsheet, 
   Plus, 
-  RefreshCw,
-  X,
-  Trash2,
-  Key,
-  UserPlus
+  RefreshCw, 
+  X, 
+  Trash2, 
+  Key, 
+  UserPlus, 
+  Copy, 
+  Check, 
+  ShieldAlert, 
+  Power 
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -121,8 +129,10 @@ export default function AdminDashboardPage() {
   // Vendor Accounts & Stalls Modals State
   const [showCreateStallModal, setShowCreateStallModal] = useState<boolean>(false);
   const [newStallName, setNewStallName] = useState<string>('');
+  const [newStallCode, setNewStallCode] = useState<string>('');
   const [newStallCampus, setNewStallCampus] = useState<string>('Hyderabad');
   const [stallSubmitting, setStallSubmitting] = useState<boolean>(false);
+  const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null);
 
   const [showCreateAccountModal, setShowCreateAccountModal] = useState<boolean>(false);
   const [newAccName, setNewAccName] = useState<string>('');
@@ -181,6 +191,20 @@ export default function AdminDashboardPage() {
     storeEvents.addEventListener('stalls_updated', handleUpdate);
     storeEvents.addEventListener('vendor_accounts_updated', handleUpdate);
 
+    // Supabase Realtime channel for instant multi-device live updates
+    let channel: any = null;
+    if (isSupabaseConfigured() && supabase) {
+      channel = supabase
+        .channel('cas-admin-live')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions' }, () => {
+          loadData();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'stalls' }, () => {
+          loadData();
+        })
+        .subscribe();
+    }
+
     return () => {
       storeEvents.removeEventListener('transaction_created', handleUpdate);
       storeEvents.removeEventListener('transaction_voided', handleUpdate);
@@ -190,6 +214,9 @@ export default function AdminDashboardPage() {
       storeEvents.removeEventListener('roster_uploaded', handleUpdate);
       storeEvents.removeEventListener('stalls_updated', handleUpdate);
       storeEvents.removeEventListener('vendor_accounts_updated', handleUpdate);
+      if (channel && supabase) {
+        supabase.removeChannel(channel);
+      }
     };
   }, []);
 
@@ -291,15 +318,45 @@ export default function AdminDashboardPage() {
       await createStall({
         name: newStallName.trim(),
         campus: newStallCampus,
+        stall_code: newStallCode.trim() || undefined,
         vendor_name: 'Blue Spring Catering',
       });
       setShowCreateStallModal(false);
       setNewStallName('');
+      setNewStallCode('');
       await loadData();
     } catch (err: any) {
       alert(err?.message || 'Error creating stall');
     } finally {
       setStallSubmitting(false);
+    }
+  };
+
+  const handleRegenerateCode = async (stallId: string, stallName: string) => {
+    if (!confirm(`Regenerate Stall Code for "${stallName}"?\n\nCashiers will need to use the newly generated code to unlock the camera on their phones.`)) return;
+    try {
+      const code = await regenerateStallCode(stallId);
+      await loadData();
+      alert(`New Stall Code for "${stallName}": ${code}`);
+    } catch (err: any) {
+      alert(err?.message || 'Error regenerating stall code');
+    }
+  };
+
+  const handleToggleStallCode = async (stallId: string, currentActive: boolean) => {
+    try {
+      await toggleStallCodeActive(stallId, !currentActive);
+      await loadData();
+    } catch (err: any) {
+      alert(err?.message || 'Error updating stall code');
+    }
+  };
+
+  const handleCopyStallCode = (code: string, stallId: string) => {
+    if (navigator?.clipboard) {
+      navigator.clipboard.writeText(code);
+      setCopiedCodeId(stallId);
+      setTimeout(() => setCopiedCodeId(null), 2000);
     }
   };
 
@@ -962,14 +1019,15 @@ export default function AdminDashboardPage() {
                       <th className="py-3 px-4">Stall Name</th>
                       <th className="py-3 px-4">Campus</th>
                       <th className="py-3 px-4">Vendor Partner</th>
-                      <th className="py-3 px-4">Status</th>
-                      <th className="py-3 px-4 text-right">Action</th>
+                      <th className="py-3 px-4">Stall Code (Cashier Login)</th>
+                      <th className="py-3 px-4">Code Status</th>
+                      <th className="py-3 px-4 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-200 font-medium">
                     {stalls.length === 0 ? (
                       <tr>
-                        <td colSpan={5} className="py-8 text-center text-gray-400">
+                        <td colSpan={6} className="py-8 text-center text-gray-400">
                           No stalls created yet. Click &quot;Create Stall&quot; to configure your first catering stall.
                         </td>
                       </tr>
@@ -988,18 +1046,61 @@ export default function AdminDashboardPage() {
                             {s.vendor_name || 'Blue Spring Catering'}
                           </td>
                           <td className="py-3.5 px-4">
-                            <span className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-semibold text-[10px]">
-                              Active
-                            </span>
+                            <div className="flex items-center space-x-1.5 font-mono">
+                              <span className="font-bold text-[#2F6DB5] bg-blue-50 border border-blue-200 px-2.5 py-1 rounded-lg text-xs">
+                                {s.stall_code || 'UNASSIGNED'}
+                              </span>
+                              {s.stall_code && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopyStallCode(s.stall_code!, s.id)}
+                                  className="p-1 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition cursor-pointer"
+                                  title="Copy Stall Code"
+                                >
+                                  {copiedCodeId === s.id ? (
+                                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                  ) : (
+                                    <Copy className="w-3.5 h-3.5" />
+                                  )}
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                          <td className="py-3.5 px-4">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleStallCode(s.id, s.code_active !== false)}
+                              className={`px-2.5 py-0.5 rounded-full font-semibold text-[10px] border flex items-center gap-1 transition cursor-pointer ${
+                                s.code_active !== false
+                                  ? 'bg-emerald-50 border-emerald-200 text-emerald-700 hover:bg-rose-50 hover:text-rose-700 hover:border-rose-200'
+                                  : 'bg-rose-50 border-rose-200 text-rose-700 hover:bg-emerald-50 hover:text-emerald-700 hover:border-emerald-200'
+                              }`}
+                              title="Click to toggle code Active / Disabled"
+                            >
+                              <Power className="w-3 h-3" />
+                              <span>{s.code_active !== false ? 'Active' : 'Disabled'}</span>
+                            </button>
                           </td>
                           <td className="py-3.5 px-4 text-right">
-                            <button
-                              onClick={() => handleDeleteStall(s.id, s.name)}
-                              className="p-1.5 rounded-lg text-gray-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer"
-                              title="Delete stall"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
+                            <div className="flex items-center justify-end space-x-1">
+                              <button
+                                type="button"
+                                onClick={() => handleRegenerateCode(s.id, s.name)}
+                                className="p-1.5 rounded-lg text-gray-500 hover:text-[#2F6DB5] hover:bg-blue-50 transition cursor-pointer flex items-center gap-1 text-[11px] font-semibold"
+                                title="Regenerate Stall Code"
+                              >
+                                <RefreshCw className="w-3.5 h-3.5" />
+                                <span>Regenerate</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteStall(s.id, s.name)}
+                                className="p-1.5 rounded-lg text-gray-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer"
+                                title="Delete stall"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))
@@ -1547,6 +1648,20 @@ export default function AdminDashboardPage() {
                   <option value="Hyderabad">Hyderabad</option>
                   <option value="Mohali">Mohali</option>
                 </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1">
+                  Stall Code (Cashier Login)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. STALL01 (Leave blank to auto-generate)"
+                  value={newStallCode}
+                  onChange={(e) => setNewStallCode(e.target.value.toUpperCase())}
+                  className="w-full bg-white border border-gray-300 rounded-xl px-3 py-2 text-xs font-mono font-bold text-gray-900 focus:outline-none focus:ring-2 focus:ring-[#2F6DB5]"
+                />
+                <p className="text-[10px] text-gray-400 mt-1">Cashiers type this code on their phones at /scan to unlock camera.</p>
               </div>
 
               <div className="grid grid-cols-2 gap-2 pt-3">

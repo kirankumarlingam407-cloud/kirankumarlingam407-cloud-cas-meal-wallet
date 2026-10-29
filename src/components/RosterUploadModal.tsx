@@ -30,6 +30,19 @@ function todayStr() {
   return new Date().toISOString().split('T')[0];
 }
 
+const CLEAN_CODE_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+function generateCleanCode(existingCodes: Set<string>): string {
+  let code = '';
+  do {
+    code = '';
+    for (let i = 0; i < 6; i++) {
+      code += CLEAN_CODE_CHARS.charAt(Math.floor(Math.random() * CLEAN_CODE_CHARS.length));
+    }
+  } while (existingCodes.has(code));
+  return code;
+}
+
 /** Parse an xlsx ArrayBuffer into RosterRow[] using SheetJS */
 async function parseRosterXlsx(buffer: ArrayBuffer, fileName: string): Promise<RosterRow[]> {
   // Dynamically import xlsx so it never runs on the server
@@ -45,7 +58,7 @@ async function parseRosterXlsx(buffer: ArrayBuffer, fileName: string): Promise<R
   const raw: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
   if (raw.length < 2) throw new Error('The file appears to be empty (no data rows found).');
 
-  // Header row (row 0) — we accept flexible header names
+  // Header row (row 0) — match standard headers: Name, Role, Phone, Email, Access Code, Wallet Amount (INR)
   const headers: string[] = raw[0].map((h: any) => String(h).trim().toLowerCase());
   const col = (names: string[]) => headers.findIndex((h) => names.some((n) => h.includes(n)));
 
@@ -53,10 +66,30 @@ async function parseRosterXlsx(buffer: ArrayBuffer, fileName: string): Promise<R
   const idxRole   = col(['role']);
   const idxPhone  = col(['phone', 'mobile', 'contact']);
   const idxEmail  = col(['email']);
-  const idxWallet = col(['wallet', 'amount', 'inr']);
+  const idxCode   = col(['access code', 'code']);
+  const idxWallet = col(['wallet amount', 'wallet', 'amount', 'inr']);
 
   const rows: RosterRow[] = [];
+  const seenCodesInFile = new Set<string>();
+  const duplicateCodesInFile = new Set<string>();
 
+  // Pass 1: Identify duplicate explicitly-provided access codes in the file
+  for (let i = 1; i < raw.length; i++) {
+    const r = raw[i];
+    const allEmpty = r.every((c: any) => String(c).trim() === '');
+    if (allEmpty) continue;
+
+    const codeProvided = idxCode >= 0 ? String(r[idxCode] ?? '').trim().toUpperCase() : '';
+    if (codeProvided) {
+      if (seenCodesInFile.has(codeProvided)) {
+        duplicateCodesInFile.add(codeProvided);
+      } else {
+        seenCodesInFile.add(codeProvided);
+      }
+    }
+  }
+
+  // Pass 2: Parse and validate each row
   for (let i = 1; i < raw.length; i++) {
     const r = raw[i];
 
@@ -68,6 +101,7 @@ async function parseRosterXlsx(buffer: ArrayBuffer, fileName: string): Promise<R
     const role         = idxRole   >= 0 ? String(r[idxRole] ?? '').trim()   : '';
     const phone        = idxPhone  >= 0 ? String(r[idxPhone] ?? '').trim()  : '';
     const email        = idxEmail  >= 0 ? String(r[idxEmail] ?? '').trim()  : '';
+    const codeRaw      = idxCode   >= 0 ? String(r[idxCode] ?? '').trim().toUpperCase() : '';
     const walletRaw    = idxWallet >= 0 ? r[idxWallet] : '';
     const walletNum    = typeof walletRaw === 'number' ? walletRaw : parseFloat(String(walletRaw).replace(/[^\d.]/g, ''));
 
@@ -79,12 +113,29 @@ async function parseRosterXlsx(buffer: ArrayBuffer, fileName: string): Promise<R
     if (isNaN(walletNum) || walletNum <= 0) errors.push('Wallet Amount must be a positive whole number');
     else if (!Number.isInteger(walletNum)) errors.push('Wallet Amount must be a whole number (no decimals)');
 
+    let assignedCode = codeRaw;
+    if (codeRaw) {
+      // Validate provided access code
+      if (codeRaw.length < 4 || codeRaw.length > 10) {
+        errors.push(`Access Code "${codeRaw}" must be 4 to 10 characters`);
+      } else if (!/^[A-Z0-9]+$/.test(codeRaw)) {
+        errors.push(`Access Code "${codeRaw}" must contain only letters and numbers`);
+      } else if (duplicateCodesInFile.has(codeRaw)) {
+        errors.push(`Duplicate Access Code "${codeRaw}" found in uploaded file`);
+      }
+    } else {
+      // Auto-generate clean 6-character code (no 0/O or 1/I)
+      assignedCode = generateCleanCode(seenCodesInFile);
+      seenCodesInFile.add(assignedCode);
+    }
+
     rows.push({
       rowIndex: i,
       name,
       role,
       phone: phone || undefined,
       email: email || undefined,
+      access_code: assignedCode,
       wallet_amount: isNaN(walletNum) ? 0 : Math.round(walletNum),
       valid: errors.length === 0,
       errors,
@@ -98,17 +149,16 @@ async function parseRosterXlsx(buffer: ArrayBuffer, fileName: string): Promise<R
 async function downloadSampleTemplate() {
   const XLSX = await import('xlsx');
   const data = [
-    ['Name', 'Role', 'Phone', 'Email', 'Wallet Amount (INR)'],
-    ['Ramesh Kumar',  'Interview Coordinator', '9876543210', 'ramesh@example.com',  5000],
-    ['Priya Singh',   'Driver',                '9123456789', 'priya@example.com',   3000],
-    ['Anita Sharma',  'CAS Staff',             '9988776655', 'anita@example.com',   4000],
+    ['Name', 'Role', 'Phone', 'Email', 'Access Code', 'Wallet Amount (INR)'],
+    ['Ramesh Kumar',  'Interview Coordinator', '9876543210', 'ramesh@example.com',  'RAME24', 5000],
+    ['Priya Singh',   'Driver',                '9123456789', 'priya@example.com',   'PRIY88', 3000],
+    ['Anita Sharma',  'CAS Staff',             '9988776655', 'anita@example.com',   '',       4000],
   ];
   const ws = XLSX.utils.aoa_to_sheet(data);
 
   // Column widths
-  ws['!cols'] = [{ wch: 24 }, { wch: 26 }, { wch: 16 }, { wch: 28 }, { wch: 22 }];
+  ws['!cols'] = [{ wch: 22 }, { wch: 26 }, { wch: 16 }, { wch: 28 }, { wch: 16 }, { wch: 22 }];
 
-  // Style header row bold (xlsx-style not available in community edition — add a note)
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Roster');
 
@@ -117,7 +167,8 @@ async function downloadSampleTemplate() {
     ['CAS Meal Wallet — Roster Template Instructions'],
     [''],
     ['Sheet name must be "Roster"'],
-    ['Required columns: Name, Role, Phone, Email, Wallet Amount (INR)'],
+    ['Required columns: Name, Role, Phone, Email, Access Code, Wallet Amount (INR)'],
+    ['Access Code: 4 to 10 characters, unique across event. If left blank, a random 6-character clean code (no 0/O, 1/I) is auto-generated.'],
     ['Valid Roles: Interview Coordinator | Driver | CAS Staff'],
     ['At least one of Phone or Email must be filled per row'],
     ['Wallet Amount must be a positive whole number (INR)'],
@@ -135,39 +186,38 @@ async function downloadSampleTemplate() {
   URL.revokeObjectURL(url);
 }
 
-/** Generate the links sheet after a successful import */
-async function downloadLinksSheet(
+/** Generate the downloadable sheet after import so CAS can send codes to people */
+async function downloadDispatchedRosterSheet(
   links: RosterImportResult['personLinks'],
   campus: string,
   baseUrl: string
 ) {
   const XLSX = await import('xlsx');
-  const header = ['Name', 'Role', 'Campus', 'Short Code', 'Phone', 'Email', 'Wallet (INR)', 'Wallet Link'];
+  const header = ['Name', 'Role', 'Phone', 'Email', 'Access Code', 'Wallet Amount (INR)', 'Meal Pass Link'];
   const rows = links.map((l) => [
     l.name,
     l.role,
-    l.campus,
-    l.short_code,
     l.phone || '',
     l.email || '',
+    l.access_code || l.short_code,
     l.wallet_total,
-    `${baseUrl}/w/${l.token}`,
+    `${baseUrl}/pass?code=${encodeURIComponent(l.access_code || l.short_code)}`,
   ]);
 
   const ws = XLSX.utils.aoa_to_sheet([header, ...rows]);
   ws['!cols'] = [
-    { wch: 24 }, { wch: 26 }, { wch: 14 }, { wch: 10 },
-    { wch: 16 }, { wch: 28 }, { wch: 14 }, { wch: 60 },
+    { wch: 24 }, { wch: 26 }, { wch: 16 }, { wch: 28 },
+    { wch: 16 }, { wch: 20 }, { wch: 50 },
   ];
 
   const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Wallet Links');
+  XLSX.utils.book_append_sheet(wb, ws, 'Dispatched Codes');
   const buf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
   const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `CAS_Wallet_Links_${campus}_${new Date().toISOString().split('T')[0]}.xlsx`;
+  a.download = `CAS_Dispatched_Roster_Codes_${campus}_${new Date().toISOString().split('T')[0]}.xlsx`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -245,6 +295,7 @@ export function RosterUploadModal({ open, onClose, settings, onSuccess }: Roster
           role: r.role,
           phone: r.phone,
           email: r.email,
+          access_code: r.access_code,
           wallet_amount: r.wallet_amount,
         })),
         date,
@@ -263,10 +314,10 @@ export function RosterUploadModal({ open, onClose, settings, onSuccess }: Roster
     }
   };
 
-  const handleDownloadLinks = () => {
+  const handleDownloadDispatchedRoster = () => {
     if (!result) return;
     const base = typeof window !== 'undefined' ? window.location.origin : '';
-    downloadLinksSheet(result.personLinks, campus, base);
+    downloadDispatchedRosterSheet(result.personLinks, campus, base);
   };
 
   if (!open) return null;
@@ -317,15 +368,15 @@ export function RosterUploadModal({ open, onClose, settings, onSuccess }: Roster
               </div>
 
               <p className="text-sm text-gray-500 text-center">
-                Wallet links have been generated for all {result.personLinks.length} people. Download the sheet below.
+                Access codes and meal passes ready for all {result.personLinks.length} people. Download the sheet below to send codes to people.
               </p>
 
               <button
-                onClick={handleDownloadLinks}
-                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm transition"
+                onClick={handleDownloadDispatchedRoster}
+                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-[#2F6DB5] hover:bg-[#255a96] text-white font-semibold text-sm transition shadow-sm cursor-pointer"
               >
                 <Download className="w-4 h-4" />
-                Download Wallet Links Sheet (.xlsx)
+                Download Dispatched Roster Sheet (.xlsx)
               </button>
             </div>
           ) : (
@@ -455,9 +506,14 @@ export function RosterUploadModal({ open, onClose, settings, onSuccess }: Roster
                       <div className="divide-y divide-gray-50 max-h-44 overflow-y-auto">
                         {validRows.map((r) => (
                           <div key={r.rowIndex} className="px-3 py-2 flex items-center justify-between text-xs">
-                            <div>
-                              <span className="font-medium text-gray-800">{r.name}</span>
-                              <span className="text-gray-400 ml-1.5">· {r.role}</span>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-[11px] font-bold px-1.5 py-0.5 rounded bg-blue-50 text-[#2F6DB5] border border-blue-200">
+                                {r.access_code}
+                              </span>
+                              <div>
+                                <span className="font-medium text-gray-800">{r.name}</span>
+                                <span className="text-gray-400 ml-1">· {r.role}</span>
+                              </div>
                             </div>
                             <span className="text-blue-700 font-semibold">₹{r.wallet_amount.toLocaleString('en-IN')}</span>
                           </div>

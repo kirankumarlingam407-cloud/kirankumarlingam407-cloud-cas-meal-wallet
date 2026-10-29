@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS stalls (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT UNIQUE NOT NULL,
   campus TEXT NOT NULL DEFAULT 'Hyderabad',
+  stall_code TEXT UNIQUE,
+  code_active BOOLEAN NOT NULL DEFAULT true,
   vendor_name TEXT NOT NULL DEFAULT 'Blue Spring Catering',
   is_active BOOLEAN NOT NULL DEFAULT true,
   created_at TIMESTAMPTZ DEFAULT now()
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS stalls (
 
 CREATE INDEX IF NOT EXISTS idx_stalls_name ON stalls(name);
 CREATE INDEX IF NOT EXISTS idx_stalls_campus ON stalls(campus);
+CREATE INDEX IF NOT EXISTS idx_stalls_code ON stalls(stall_code);
 
 -- 3. VENDOR & CASHIER ACCOUNTS TABLE
 CREATE TABLE IF NOT EXISTS vendor_accounts (
@@ -69,6 +72,7 @@ CREATE TABLE IF NOT EXISTS people (
   role TEXT NOT NULL, -- 'Interview Coordinator', 'Driver', 'CAS Staff'
   token TEXT UNIQUE NOT NULL,
   short_code TEXT UNIQUE NOT NULL,
+  access_code TEXT UNIQUE,
   phone TEXT,
   email TEXT,
   wallet_total NUMERIC(10,2) NOT NULL DEFAULT 4000.00,
@@ -79,7 +83,26 @@ CREATE TABLE IF NOT EXISTS people (
 
 CREATE INDEX IF NOT EXISTS idx_people_token ON people(token);
 CREATE INDEX IF NOT EXISTS idx_people_short_code ON people(short_code);
+CREATE INDEX IF NOT EXISTS idx_people_access_code ON people(access_code);
 CREATE INDEX IF NOT EXISTS idx_people_role ON people(role);
+
+-- 4B. SCAN ATTEMPTS AUDIT LOG (Log every scan attempt, accepted or rejected)
+CREATE TABLE IF NOT EXISTS scan_attempts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
+  stall_code TEXT,
+  stall_name TEXT,
+  person_code TEXT,
+  person_name TEXT,
+  slot TEXT,
+  amount NUMERIC(10,2),
+  status TEXT NOT NULL CHECK (status IN ('accepted', 'rejected')),
+  reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_attempts_time ON scan_attempts(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_attempts_stall ON scan_attempts(stall_code);
 
 -- 5. ROSTER UPLOAD HISTORY TABLE
 CREATE TABLE IF NOT EXISTS roster_history (

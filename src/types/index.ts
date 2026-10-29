@@ -15,6 +15,7 @@ export interface Person {
   role: UserRole | string;
   token: string;
   short_code: string;
+  access_code?: string;      // 4 to 10 chars, case-insensitive unique code
   phone?: string;
   email?: string;
   wallet_total: number;
@@ -42,6 +43,8 @@ export interface Stall {
   id: string;
   name: string;
   campus: string;
+  stall_code: string;        // Code used by cashier to log in
+  code_active: boolean;      // Whether this stall code is enabled
   vendor_id?: string;
   vendor_name?: string;
   is_active: boolean;
@@ -147,9 +150,24 @@ export interface RosterRow {
   role: string;
   phone?: string;
   email?: string;
+  access_code?: string;    // User-provided or auto-generated code
   wallet_amount: number;
   valid: boolean;
   errors: string[];
+}
+
+/** Log of every scan attempt, accepted or rejected */
+export interface ScanAttempt {
+  id: string;
+  timestamp: string;       // ISO timestamp
+  stall_code?: string;
+  stall_name?: string;
+  person_code?: string;
+  person_name?: string;
+  slot?: MealSlot;
+  amount?: number;
+  status: 'accepted' | 'rejected';
+  reason?: string;
 }
 
 /** Persisted record of each upload operation */

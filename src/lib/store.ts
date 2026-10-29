@@ -10,6 +10,7 @@ import {
   RosterUploadHistory,
   Stall,
   VendorAccount,
+  ScanAttempt,
 } from '@/types';
 import {
   INITIAL_SETTINGS,
@@ -31,6 +32,7 @@ const STORAGE_KEYS = {
   ROSTER_HISTORY: 'cas_wallet_roster_history_v2',
   STALLS: 'cas_wallet_stalls_v2',
   VENDOR_ACCOUNTS: 'cas_wallet_vendor_accounts_v2',
+  SCAN_ATTEMPTS: 'cas_wallet_scan_attempts_v2',
 };
 
 // Event emitter for local reactivity + cross-tab BroadcastChannel
@@ -86,6 +88,163 @@ const safeStorage = {
       console.warn(`Error saving ${key} to localStorage:`, e);
     }
   },
+};
+
+// ==============================================================================
+// INDIA TIME (ASIA/KOLKATA) & DATE HELPERS
+// ==============================================================================
+
+/**
+ * Returns YYYY-MM-DD in India Standard Time (Asia/Kolkata).
+ * Midnight to midnight in India defines the start and end of each day.
+ */
+export const getIndiaDateString = (dateInput: Date | string = new Date()): string => {
+  try {
+    const date = typeof dateInput === 'string' ? new Date(dateInput) : dateInput;
+    if (isNaN(date.getTime())) return new Date().toISOString().split('T')[0];
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(date);
+  } catch (e) {
+    return new Date().toISOString().split('T')[0];
+  }
+};
+
+// ==============================================================================
+// DEVICE RATE-LIMITING (5 WRONG ATTEMPTS -> 15 MIN LOCKOUT)
+// ==============================================================================
+
+const RATE_LIMIT_STORAGE_KEY = 'cas_rate_limits_v2';
+
+export interface RateLimitStatus {
+  allowed: boolean;
+  remainingMinutes: number;
+  attempts: number;
+}
+
+export const checkRateLimit = (key: 'person_code' | 'stall_code'): RateLimitStatus => {
+  if (typeof window === 'undefined') return { allowed: true, remainingMinutes: 0, attempts: 0 };
+  try {
+    const raw = localStorage.getItem(`${RATE_LIMIT_STORAGE_KEY}_${key}`);
+    if (!raw) return { allowed: true, remainingMinutes: 0, attempts: 0 };
+    const state = JSON.parse(raw);
+    const now = Date.now();
+    if (state.lockedUntil && now < state.lockedUntil) {
+      const remainingMinutes = Math.max(1, Math.ceil((state.lockedUntil - now) / 60000));
+      return { allowed: false, remainingMinutes, attempts: state.attempts || 5 };
+    }
+    if (state.lockedUntil && now >= state.lockedUntil) {
+      // Lock expired, automatically clear
+      localStorage.removeItem(`${RATE_LIMIT_STORAGE_KEY}_${key}`);
+      return { allowed: true, remainingMinutes: 0, attempts: 0 };
+    }
+    return { allowed: true, remainingMinutes: 0, attempts: state.attempts || 0 };
+  } catch (e) {
+    return { allowed: true, remainingMinutes: 0, attempts: 0 };
+  }
+};
+
+export const recordFailedAttempt = (key: 'person_code' | 'stall_code'): RateLimitStatus => {
+  if (typeof window === 'undefined') return { allowed: true, remainingMinutes: 0, attempts: 1 };
+  try {
+    const storageKey = `${RATE_LIMIT_STORAGE_KEY}_${key}`;
+    const raw = localStorage.getItem(storageKey);
+    const state = raw ? JSON.parse(raw) : { attempts: 0, lockedUntil: 0 };
+    const attempts = (state.attempts || 0) + 1;
+    if (attempts >= 5) {
+      const lockedUntil = Date.now() + 15 * 60 * 1000; // 15 minutes lockout
+      localStorage.setItem(storageKey, JSON.stringify({ attempts, lockedUntil }));
+      return { allowed: false, remainingMinutes: 15, attempts };
+    }
+    localStorage.setItem(storageKey, JSON.stringify({ attempts, lockedUntil: 0 }));
+    return { allowed: true, remainingMinutes: 0, attempts };
+  } catch (e) {
+    return { allowed: true, remainingMinutes: 0, attempts: 1 };
+  }
+};
+
+export const clearRateLimit = (key: 'person_code' | 'stall_code'): void => {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.removeItem(`${RATE_LIMIT_STORAGE_KEY}_${key}`);
+  } catch (e) {}
+};
+
+// ==============================================================================
+// CODE GENERATORS (CLEAN CHARACTERS: NO 0/O OR 1/I)
+// ==============================================================================
+
+/**
+ * Generates a clean 6-character random access code without confusing characters (no 0, O, 1, I).
+ */
+export const generateCleanAccessCode = (existingCodes: Set<string> = new Set()): string => {
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  let attempts = 0;
+  do {
+    code = '';
+    for (let i = 0; i < 6; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    attempts++;
+  } while (existingCodes.has(code.toUpperCase()) && attempts < 1000);
+  return code;
+};
+
+/**
+ * Generates a clean stall code (e.g. STALL-01 or STALL-XXX).
+ */
+export const generateStallCode = (existingCodes: Set<string> = new Set()): string => {
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  let attempts = 0;
+  do {
+    code = 'STALL-';
+    for (let i = 0; i < 3; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    attempts++;
+  } while (existingCodes.has(code.toUpperCase()) && attempts < 1000);
+  return code;
+};
+
+// ==============================================================================
+// SCAN ATTEMPTS AUDIT LOG
+// ==============================================================================
+
+export const logScanAttempt = async (
+  attempt: Omit<ScanAttempt, 'id' | 'timestamp'>
+): Promise<ScanAttempt> => {
+  const newAttempt: ScanAttempt = {
+    id: `scan-att-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    timestamp: new Date().toISOString(),
+    ...attempt,
+  };
+
+  initLocalStore();
+  const attempts = safeStorage.get<ScanAttempt[]>(STORAGE_KEYS.SCAN_ATTEMPTS, []);
+  const updated = [newAttempt, ...attempts].slice(0, 500); // keep last 500
+  safeStorage.set(STORAGE_KEYS.SCAN_ATTEMPTS, updated);
+  storeEvents.emit('scan_attempt_logged', newAttempt);
+
+  if (isSupabaseConfigured() && supabase) {
+    try {
+      await supabase.from('scan_attempts').insert(newAttempt);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  return newAttempt;
+};
+
+export const getScanAttempts = async (): Promise<ScanAttempt[]> => {
+  if (isSupabaseConfigured() && supabase) {
+    try {
+      const { data, error } = await supabase.from('scan_attempts').select('*').order('timestamp', { ascending: false }).limit(200);
+      if (!error && data) return data as ScanAttempt[];
+    } catch (e) {}
+  }
+  initLocalStore();
+  return safeStorage.get<ScanAttempt[]>(STORAGE_KEYS.SCAN_ATTEMPTS, []);
 };
 
 // Initialize Local State if empty (clean state, zero dummy records)
@@ -188,6 +347,84 @@ export const getPersonByShortCode = async (code: string): Promise<Person | null>
   return people.find((p) => p.short_code.toUpperCase() === clean) || null;
 };
 
+export const getPersonByCode = async (code: string): Promise<Person | null> => {
+  if (!code || !code.trim()) return null;
+  const clean = code.trim().toUpperCase();
+
+  if (isSupabaseConfigured() && supabase) {
+    const { data, error } = await supabase
+      .from('people')
+      .select('*')
+      .or(`access_code.ilike.${clean},short_code.ilike.${clean},token.eq.${code.trim()}`)
+      .maybeSingle();
+    if (!error && data) return data as Person;
+  }
+
+  initLocalStore();
+  const people = safeStorage.get<Person[]>(STORAGE_KEYS.PEOPLE, INITIAL_PEOPLE);
+  const found = people.find(
+    (p) =>
+      p.active !== false &&
+      ((p.access_code && p.access_code.toUpperCase() === clean) ||
+        (p.short_code && p.short_code.toUpperCase() === clean) ||
+        p.token === code.trim())
+  );
+  return found || null;
+};
+
+export interface PersonPassData {
+  person: Person;
+  wallet_total: number;
+  total_spent: number;
+  remaining_wallet: number;
+  today_spent: number;
+  remaining_ceiling: number;
+  slot_usage: Record<MealSlot, { used: number; max: number; completed: boolean }>;
+  today_transactions: Transaction[];
+}
+
+export const getPersonPassData = async (code: string): Promise<PersonPassData | null> => {
+  if (!code || !code.trim()) return null;
+  const person = await getPersonByCode(code);
+  if (!person) return null;
+
+  const settings = await getSettings();
+  const transactions = await getTransactions({ personId: person.id });
+  const validTxs = transactions.filter((t) => !t.voided);
+
+  const total_spent = validTxs.reduce((sum, t) => sum + t.amount, 0);
+  const remaining_wallet = Math.max(0, person.wallet_total - total_spent);
+
+  // Filter today's transactions in Asia/Kolkata date
+  const todayIndiaStr = getIndiaDateString(new Date());
+  const today_transactions = validTxs.filter((t) => getIndiaDateString(t.created_at) === todayIndiaStr);
+  const today_spent = today_transactions.reduce((sum, t) => sum + t.amount, 0);
+  const remaining_ceiling = Math.max(0, settings.daily_ceiling - today_spent);
+
+  const allSlots: MealSlot[] = ['breakfast', 'snacks', 'beverages', 'lunch', 'dinner'];
+  const slot_usage = allSlots.reduce((acc, slot) => {
+    const used = today_transactions.filter((t) => t.slot === slot).length;
+    const max = settings.slot_max_scans[slot] ?? (slot === 'snacks' || slot === 'beverages' ? 2 : 1);
+    acc[slot] = {
+      used,
+      max,
+      completed: used >= max,
+    };
+    return acc;
+  }, {} as Record<MealSlot, { used: number; max: number; completed: boolean }>);
+
+  return {
+    person,
+    wallet_total: person.wallet_total,
+    total_spent,
+    remaining_wallet,
+    today_spent,
+    remaining_ceiling,
+    slot_usage,
+    today_transactions,
+  };
+};
+
 export const getTransactions = async (filters?: {
   personId?: string;
   slot?: MealSlot;
@@ -240,13 +477,37 @@ export const getStalls = async (): Promise<Stall[]> => {
   return safeStorage.get<Stall[]>(STORAGE_KEYS.STALLS, INITIAL_STALLS);
 };
 
-export const createStall = async (stallData: { name: string; campus: string; vendor_name?: string }): Promise<Stall> => {
+export const getStallByCode = async (stallCode: string): Promise<Stall | null> => {
+  if (!stallCode || !stallCode.trim()) return null;
+  const clean = stallCode.trim().toUpperCase();
+  const stalls = await getStalls();
+  const found = stalls.find(
+    (s) =>
+      s.is_active !== false &&
+      s.code_active !== false &&
+      s.stall_code &&
+      s.stall_code.trim().toUpperCase() === clean
+  );
+  return found || null;
+};
+
+export const createStall = async (stallData: {
+  name: string;
+  campus: string;
+  stall_code?: string;
+  vendor_name?: string;
+}): Promise<Stall> => {
   initLocalStore();
   const stalls = safeStorage.get<Stall[]>(STORAGE_KEYS.STALLS, INITIAL_STALLS);
+  const existingCodes = new Set(stalls.map((s) => (s.stall_code || '').toUpperCase()));
+  const assignedCode = stallData.stall_code?.trim().toUpperCase() || generateStallCode(existingCodes);
+
   const newStall: Stall = {
     id: `stall-${Date.now()}`,
     name: stallData.name.trim(),
     campus: stallData.campus.trim(),
+    stall_code: assignedCode,
+    code_active: true,
     vendor_name: stallData.vendor_name || 'Blue Spring Catering',
     is_active: true,
     created_at: new Date().toISOString(),
@@ -260,6 +521,48 @@ export const createStall = async (stallData: { name: string; campus: string; ven
   safeStorage.set(STORAGE_KEYS.STALLS, updated);
   storeEvents.emit('stalls_updated', updated);
   return newStall;
+};
+
+export const regenerateStallCode = async (stallId: string): Promise<string> => {
+  initLocalStore();
+  const stalls = safeStorage.get<Stall[]>(STORAGE_KEYS.STALLS, INITIAL_STALLS);
+  const existingCodes = new Set(stalls.map((s) => (s.stall_code || '').toUpperCase()));
+  const newCode = generateStallCode(existingCodes);
+
+  const updated = stalls.map((s) => {
+    if (s.id === stallId) {
+      return { ...s, stall_code: newCode, code_active: true };
+    }
+    return s;
+  });
+
+  if (isSupabaseConfigured() && supabase) {
+    await supabase.from('stalls').update({ stall_code: newCode, code_active: true }).eq('id', stallId);
+  }
+
+  safeStorage.set(STORAGE_KEYS.STALLS, updated);
+  storeEvents.emit('stalls_updated', updated);
+  return newCode;
+};
+
+export const toggleStallCodeActive = async (stallId: string, active: boolean): Promise<boolean> => {
+  initLocalStore();
+  const stalls = safeStorage.get<Stall[]>(STORAGE_KEYS.STALLS, INITIAL_STALLS);
+
+  const updated = stalls.map((s) => {
+    if (s.id === stallId) {
+      return { ...s, code_active: active };
+    }
+    return s;
+  });
+
+  if (isSupabaseConfigured() && supabase) {
+    await supabase.from('stalls').update({ code_active: active }).eq('id', stallId);
+  }
+
+  safeStorage.set(STORAGE_KEYS.STALLS, updated);
+  storeEvents.emit('stalls_updated', updated);
+  return active;
 };
 
 export const deleteStall = async (id: string): Promise<boolean> => {
@@ -431,27 +734,55 @@ export const processScan = async (input: ProcessScanInput): Promise<ScanResult> 
   let transactions = safeStorage.get<Transaction[]>(STORAGE_KEYS.TRANSACTIONS, INITIAL_TRANSACTIONS);
   let flags = safeStorage.get<Flag[]>(STORAGE_KEYS.FLAGS, INITIAL_FLAGS);
 
-  // A. Check Event Window
-  const todayStr = new Date().toISOString().split('T')[0];
+  // A. Check Event Window (India Standard Time)
+  const todayStr = getIndiaDateString(new Date());
   if (todayStr < settings.start_date || todayStr > settings.end_date) {
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: identifier.trim().toUpperCase(),
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: `Placement event inactive (${settings.start_date} to ${settings.end_date})`,
+    });
     return {
       success: false,
       error: `Placement event is inactive (Active: ${settings.start_date} to ${settings.end_date})`,
     };
   }
 
-  // B. Locate Person
+  // B. Locate Person by access_code, short_code, or token (Case-Insensitive)
   const cleanId = identifier.trim().toUpperCase();
   const person = people.find(
-    (p) => p.token === identifier.trim() || p.short_code.toUpperCase() === cleanId
+    (p) =>
+      (p.access_code && p.access_code.toUpperCase() === cleanId) ||
+      p.short_code.toUpperCase() === cleanId ||
+      p.token === identifier.trim()
   );
 
   if (!person) {
-    return { success: false, error: `Invalid QR code or short code: "${identifier}"` };
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: cleanId,
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: 'Code not registered in roster',
+    });
+    return { success: false, error: 'Code not registered in roster' };
   }
 
-  // B2. Check if person is registered (has a roster_date set) and active
+  // B2. Check if person is active in roster
   if (person.active === false) {
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: cleanId,
+      person_name: person.name,
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: 'Cardholder inactive in roster',
+    });
     return {
       success: false,
       error: `"${person.name}" is marked inactive. Please contact CAS Admin.`,
@@ -460,6 +791,15 @@ export const processScan = async (input: ProcessScanInput): Promise<ScanResult> 
 
   // B3. Check that person's roster_date is on or before today
   if (person.roster_date && person.roster_date > todayStr) {
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: cleanId,
+      person_name: person.name,
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: `Roster active from ${person.roster_date}`,
+    });
     return {
       success: false,
       error: `"${person.name}" is not yet active. Roster active from ${person.roster_date}.`,
@@ -472,27 +812,42 @@ export const processScan = async (input: ProcessScanInput): Promise<ScanResult> 
     return { success: false, error: `Invalid meal slot: ${slot}` };
   }
   if (amount > slotCap) {
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: cleanId,
+      person_name: person.name,
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: `Over ${slot.toUpperCase()} cap of ₹${slotCap}`,
+    });
     return {
       success: false,
       error: `Amount ₹${amount.toLocaleString()} exceeds ${slot.toUpperCase()} cap of ₹${slotCap.toLocaleString()}`,
     };
   }
 
-  // D. Validate Daily Ceiling and Slot Scan Counts
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
-
+  // D. Validate Daily Ceiling and Slot Scan Counts (midnight to midnight India Time)
   const todayTxs = transactions.filter(
     (t) =>
       t.person_id === person.id &&
       !t.voided &&
-      new Date(t.created_at).getTime() >= startOfToday.getTime()
+      getIndiaDateString(t.created_at) === todayStr
   );
 
   const todaySpent = todayTxs.reduce((sum, t) => sum + t.amount, 0);
   const remainingCeiling = Math.max(0, settings.daily_ceiling - todaySpent);
 
   if (todaySpent + amount > settings.daily_ceiling) {
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: cleanId,
+      person_name: person.name,
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: `Over daily ceiling of ₹${settings.daily_ceiling}`,
+    });
     return {
       success: false,
       error: `Exceeds daily ceiling of ₹${settings.daily_ceiling}. Today spent: ₹${todaySpent}, Remaining today: ₹${remainingCeiling}`,
@@ -500,20 +855,38 @@ export const processScan = async (input: ProcessScanInput): Promise<ScanResult> 
   }
 
   const slotTxs = todayTxs.filter((t) => t.slot === slot);
-  const maxSlotScans = settings.slot_max_scans[slot] ?? 1;
+  const maxSlotScans = settings.slot_max_scans[slot] ?? (slot === 'snacks' || slot === 'beverages' ? 2 : 1);
   if (slotTxs.length >= maxSlotScans) {
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: cleanId,
+      person_name: person.name,
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: `Already used ${slot.toUpperCase()} today`,
+    });
     return {
       success: false,
-      error: `Slot scan limit reached: Maximum ${maxSlotScans} scan(s) allowed for ${slot.toUpperCase()} per day`,
+      error: `Already used ${slot.toUpperCase()} today (max ${maxSlotScans} scan${maxSlotScans > 1 ? 's' : ''})`,
     };
   }
 
-  // E. Validate Total Event Wallet Balance (Carry-forward logic)
+  // E. Validate Total Event Wallet Balance
   const allValidTxs = transactions.filter((t) => t.person_id === person.id && !t.voided);
   const totalSpent = allValidTxs.reduce((sum, t) => sum + t.amount, 0);
   const remainingWallet = Math.max(0, person.wallet_total - totalSpent);
 
   if (totalSpent + amount > person.wallet_total) {
+    await logScanAttempt({
+      status: 'rejected',
+      person_code: cleanId,
+      person_name: person.name,
+      stall_name: stall_name || 'Counter',
+      slot,
+      amount,
+      reason: `Insufficient wallet balance (Remaining ₹${remainingWallet})`,
+    });
     return {
       success: false,
       error: `Insufficient wallet balance. Total: ₹${person.wallet_total}, Spent: ₹${totalSpent}, Remaining: ₹${remainingWallet}`,
@@ -543,6 +916,16 @@ export const processScan = async (input: ProcessScanInput): Promise<ScanResult> 
 
   transactions = [newTx, ...transactions];
   safeStorage.set(STORAGE_KEYS.TRANSACTIONS, transactions);
+
+  // Log scan attempt as accepted
+  await logScanAttempt({
+    status: 'accepted',
+    person_code: cleanId,
+    person_name: person.name,
+    stall_name: stall_name || 'Main Dining Counter (Stall 1)',
+    slot,
+    amount,
+  });
 
   // G. Automated Flags Checks
   const newFlags: Flag[] = [];
@@ -586,7 +969,7 @@ export const processScan = async (input: ProcessScanInput): Promise<ScanResult> 
       t.slot === slot &&
       !t.voided &&
       t.id !== newTxId &&
-      new Date(t.created_at).getTime() >= startOfToday.getTime()
+      getIndiaDateString(t.created_at) === todayStr
   );
   if (pastSlotTxsToday.length >= 2) {
     const avg =
@@ -816,6 +1199,7 @@ export interface RosterImportResult {
     name: string;
     role: string;
     short_code: string;
+    access_code: string;
     token: string;
     wallet_total: number;
     campus: string;
@@ -831,6 +1215,7 @@ export const importRosterRows = async (
     role: string;
     phone?: string;
     email?: string;
+    access_code?: string;
     wallet_amount: number;
   }>,
   rosterDate: string,   // YYYY-MM-DD
@@ -846,17 +1231,22 @@ export const importRosterRows = async (
   const personLinks: RosterImportResult['personLinks'] = [];
   const updatedPeople = [...existingPeople];
 
-  // Calculate the starting index for new short codes
-  const maxCode = existingPeople.reduce((max, p) => {
-    const num = parseInt(p.short_code.replace(/\D/g, ''), 10);
-    return isNaN(num) ? max : Math.max(max, num);
-  }, 0);
-  let nextIndex = maxCode + 1;
+  const existingCodes = new Set(
+    existingPeople.map((p) => (p.access_code || p.short_code || '').toUpperCase())
+  );
 
   for (const row of rows) {
-    // Find duplicate: same phone OR email + same campus
+    // Resolve Access Code (provided or clean auto-generated 6-char)
+    let assignedCode = (row.access_code || '').trim().toUpperCase();
+    if (!assignedCode) {
+      assignedCode = generateCleanAccessCode(existingCodes);
+    }
+    existingCodes.add(assignedCode);
+
+    // Find duplicate: same phone OR email + same campus OR matching access code
     const dupIdx = updatedPeople.findIndex((p) => {
       const campusMatch = !campus || !p.campus || p.campus === campus;
+      if (assignedCode && (p.access_code?.toUpperCase() === assignedCode || p.short_code.toUpperCase() === assignedCode)) return true;
       if (!campusMatch) return false;
       if (row.phone && p.phone && row.phone === p.phone) return true;
       if (row.email && p.email && row.email.toLowerCase() === p.email?.toLowerCase()) return true;
@@ -865,12 +1255,7 @@ export const importRosterRows = async (
 
     if (dupIdx !== -1) {
       const existing = updatedPeople[dupIdx];
-      const hasSpent = (() => {
-        const txs = safeStorage.get<Transaction[]>(STORAGE_KEYS.TRANSACTIONS, INITIAL_TRANSACTIONS);
-        return txs.some((t) => t.person_id === existing.id && !t.voided);
-      })();
 
-      // Update wallet amount & roster_date if person hasn't been soft-deleted with spend
       updatedPeople[dupIdx] = {
         ...existing,
         wallet_total: row.wallet_amount,
@@ -881,6 +1266,8 @@ export const importRosterRows = async (
         role: row.role || existing.role,
         phone: row.phone || existing.phone,
         email: row.email || existing.email,
+        access_code: assignedCode || existing.access_code || existing.short_code,
+        short_code: assignedCode || existing.short_code,
       };
       updated++;
 
@@ -888,6 +1275,7 @@ export const importRosterRows = async (
         name: updatedPeople[dupIdx].name,
         role: updatedPeople[dupIdx].role,
         short_code: updatedPeople[dupIdx].short_code,
+        access_code: updatedPeople[dupIdx].access_code || updatedPeople[dupIdx].short_code,
         token: updatedPeople[dupIdx].token,
         wallet_total: updatedPeople[dupIdx].wallet_total,
         campus,
@@ -897,16 +1285,16 @@ export const importRosterRows = async (
     } else {
       // New person
       const token = generateSecureToken(row.name.toLowerCase().replace(/[^a-z0-9]/g, '_').substring(0, 10));
-      const short_code = generateShortCode(nextIndex++);
       const newPerson: Person = {
         id: `person-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: row.name,
         role: row.role,
         phone: row.phone,
         email: row.email,
+        access_code: assignedCode,
+        short_code: assignedCode,
         wallet_total: row.wallet_amount,
         token,
-        short_code,
         campus,
         roster_date: rosterDate,
         active: true,
@@ -919,6 +1307,7 @@ export const importRosterRows = async (
         name: newPerson.name,
         role: newPerson.role,
         short_code: newPerson.short_code,
+        access_code: assignedCode,
         token: newPerson.token,
         wallet_total: newPerson.wallet_total,
         campus,
