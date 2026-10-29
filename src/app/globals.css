@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #111827;
+  --primary-blue: #2F6DB5;
+  --primary-blue-hover: #255a96;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Custom scan beam keyframe animation for vendor camera scanner */
+@keyframes scanline {
+  0% {
+    top: 5%;
+    opacity: 0.8;
+  }
+  50% {
+    top: 90%;
+    opacity: 1;
+  }
+  100% {
+    top: 5%;
+    opacity: 0.8;
+  }
+}
+
+.animate-scanline {
+  animation: scanline 2.2s ease-in-out infinite;
+}
+
+/* High contrast touch feedback for kiosk buttons */
+button:active {
+  transform: scale(0.97);
+}
+
