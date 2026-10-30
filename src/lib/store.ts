@@ -90,6 +90,17 @@ const safeStorage = {
   },
 };
 
+export const generateUUID = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
+
 // ==============================================================================
 // INDIA TIME (ASIA/KOLKATA) & DATE HELPERS
 // ==============================================================================
@@ -469,12 +480,47 @@ export const getTransactions = async (filters?: {
 // ==============================================================================
 
 export const getStalls = async (): Promise<Stall[]> => {
-  if (isSupabaseConfigured() && supabase) {
-    const { data, error } = await supabase.from('stalls').select('*').order('created_at', { ascending: true });
-    if (!error && data) return data as Stall[];
-  }
   initLocalStore();
-  return safeStorage.get<Stall[]>(STORAGE_KEYS.STALLS, INITIAL_STALLS);
+  const localStalls = safeStorage.get<Stall[]>(STORAGE_KEYS.STALLS, INITIAL_STALLS);
+  const localMap = new Map<string, Stall>();
+  localStalls.forEach((s) => {
+    if (s.id) localMap.set(s.id, s);
+    if (s.name) localMap.set(s.name.trim().toLowerCase(), s);
+  });
+
+  if (isSupabaseConfigured() && supabase) {
+    try {
+      const { data, error } = await supabase.from('stalls').select('*').order('created_at', { ascending: true });
+      if (!error && Array.isArray(data)) {
+        if (data.length > 0) {
+          const merged: Stall[] = data.map((remote: any, idx: number) => {
+            const match = localMap.get(remote.id) || localMap.get((remote.name || '').trim().toLowerCase());
+            return {
+              id: remote.id,
+              name: remote.name,
+              campus: remote.campus || 'Hyderabad',
+              stall_code: remote.stall_code || match?.stall_code || `STALL0${idx + 1}`,
+              code_active: remote.code_active !== undefined ? remote.code_active : (match?.code_active ?? true),
+              vendor_name: remote.vendor_name || 'Blue Spring Catering',
+              is_active: remote.is_active !== false,
+              created_at: remote.created_at || new Date().toISOString(),
+            };
+          });
+          safeStorage.set(STORAGE_KEYS.STALLS, merged);
+          return merged;
+        } else {
+          // If Supabase table is empty, return local stalls
+          return localStalls;
+        }
+      } else if (error) {
+        console.warn('Supabase getStalls failed, using local storage fallback:', error);
+      }
+    } catch (e) {
+      console.warn('Supabase getStalls error:', e);
+    }
+  }
+
+  return localStalls;
 };
 
 export const getStallByCode = async (stallCode: string): Promise<Stall | null> => {
@@ -502,8 +548,9 @@ export const createStall = async (stallData: {
   const existingCodes = new Set(stalls.map((s) => (s.stall_code || '').toUpperCase()));
   const assignedCode = stallData.stall_code?.trim().toUpperCase() || generateStallCode(existingCodes);
 
+  const newId = generateUUID();
   const newStall: Stall = {
-    id: `stall-${Date.now()}`,
+    id: newId,
     name: stallData.name.trim(),
     campus: stallData.campus.trim(),
     stall_code: assignedCode,
@@ -514,10 +561,64 @@ export const createStall = async (stallData: {
   };
 
   if (isSupabaseConfigured() && supabase) {
-    await supabase.from('stalls').insert(newStall);
+    try {
+      // 1. Attempt insert with full schema (including stall_code and code_active)
+      const { data, error } = await supabase
+        .from('stalls')
+        .insert({
+          id: newStall.id,
+          name: newStall.name,
+          campus: newStall.campus,
+          stall_code: newStall.stall_code,
+          code_active: newStall.code_active,
+          vendor_name: newStall.vendor_name,
+          is_active: newStall.is_active,
+        })
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        // If error is due to missing columns in Supabase schema cache (e.g. PGRST204)
+        if (error.code === 'PGRST204' || error.message.toLowerCase().includes('column')) {
+          console.warn('Supabase stalls table missing stall_code/code_active columns, inserting base columns:', error.message);
+          const { data: fallbackData, error: fallbackError } = await supabase
+            .from('stalls')
+            .insert({
+              id: newStall.id,
+              name: newStall.name,
+              campus: newStall.campus,
+              vendor_name: newStall.vendor_name,
+              is_active: newStall.is_active,
+            })
+            .select()
+            .maybeSingle();
+
+          if (fallbackError) {
+            console.error('Supabase stall fallback insert error:', fallbackError);
+            throw new Error(fallbackError.message);
+          }
+          if (fallbackData?.id) {
+            newStall.id = fallbackData.id;
+            if (fallbackData.created_at) newStall.created_at = fallbackData.created_at;
+          }
+        } else {
+          console.error('Supabase stall insert error:', error);
+          throw new Error(error.message);
+        }
+      } else if (data?.id) {
+        newStall.id = data.id;
+        if (data.created_at) newStall.created_at = data.created_at;
+      }
+    } catch (e: any) {
+      console.error('Error inserting stall into Supabase:', e);
+      throw e;
+    }
   }
 
-  const updated = [...stalls, newStall];
+  const updated = [
+    ...stalls.filter((s) => s.id !== newStall.id && s.name.toLowerCase() !== newStall.name.toLowerCase()),
+    newStall,
+  ];
   safeStorage.set(STORAGE_KEYS.STALLS, updated);
   storeEvents.emit('stalls_updated', updated);
   return newStall;
@@ -537,7 +638,11 @@ export const regenerateStallCode = async (stallId: string): Promise<string> => {
   });
 
   if (isSupabaseConfigured() && supabase) {
-    await supabase.from('stalls').update({ stall_code: newCode, code_active: true }).eq('id', stallId);
+    try {
+      await supabase.from('stalls').update({ stall_code: newCode, code_active: true }).eq('id', stallId);
+    } catch (e) {
+      console.warn('Supabase regenerateStallCode warning:', e);
+    }
   }
 
   safeStorage.set(STORAGE_KEYS.STALLS, updated);
@@ -557,7 +662,11 @@ export const toggleStallCodeActive = async (stallId: string, active: boolean): P
   });
 
   if (isSupabaseConfigured() && supabase) {
-    await supabase.from('stalls').update({ code_active: active }).eq('id', stallId);
+    try {
+      await supabase.from('stalls').update({ code_active: active }).eq('id', stallId);
+    } catch (e) {
+      console.warn('Supabase toggleStallCodeActive warning:', e);
+    }
   }
 
   safeStorage.set(STORAGE_KEYS.STALLS, updated);
@@ -571,7 +680,12 @@ export const deleteStall = async (id: string): Promise<boolean> => {
   const updated = stalls.filter((s) => s.id !== id);
 
   if (isSupabaseConfigured() && supabase) {
-    await supabase.from('stalls').delete().eq('id', id);
+    try {
+      const { error } = await supabase.from('stalls').delete().eq('id', id);
+      if (error) console.error('Supabase deleteStall error:', error);
+    } catch (e) {
+      console.warn('Supabase deleteStall warning:', e);
+    }
   }
 
   safeStorage.set(STORAGE_KEYS.STALLS, updated);
@@ -585,8 +699,12 @@ export const deleteStall = async (id: string): Promise<boolean> => {
 
 export const getVendorAccounts = async (): Promise<VendorAccount[]> => {
   if (isSupabaseConfigured() && supabase) {
-    const { data, error } = await supabase.from('vendor_accounts').select('*').order('created_at', { ascending: true });
-    if (!error && data) return data as VendorAccount[];
+    try {
+      const { data, error } = await supabase.from('vendor_accounts').select('*').order('created_at', { ascending: true });
+      if (!error && data) return data as VendorAccount[];
+    } catch (e) {
+      console.warn('Supabase getVendorAccounts warning:', e);
+    }
   }
   initLocalStore();
   return safeStorage.get<VendorAccount[]>(STORAGE_KEYS.VENDOR_ACCOUNTS, INITIAL_VENDOR_ACCOUNTS);
@@ -599,15 +717,46 @@ export const createVendorAccount = async (
   const accounts = safeStorage.get<VendorAccount[]>(STORAGE_KEYS.VENDOR_ACCOUNTS, INITIAL_VENDOR_ACCOUNTS);
   const newAccount: VendorAccount = {
     ...accountData,
-    id: `acc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    id: generateUUID(),
     created_at: new Date().toISOString(),
   };
 
   if (isSupabaseConfigured() && supabase) {
-    await supabase.from('vendor_accounts').insert(newAccount);
+    try {
+      const { data, error } = await supabase
+        .from('vendor_accounts')
+        .insert({
+          id: newAccount.id,
+          username: newAccount.username,
+          password: newAccount.password,
+          name: newAccount.name,
+          role: newAccount.role,
+          stall_id: newAccount.stall_id || null,
+          stall_name: newAccount.stall_name || null,
+          campus: newAccount.campus || 'Hyderabad',
+          is_active: newAccount.is_active !== false,
+        })
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        console.error('Supabase createVendorAccount error:', error);
+        throw new Error(error.message);
+      }
+      if (data?.id) {
+        newAccount.id = data.id;
+        if (data.created_at) newAccount.created_at = data.created_at;
+      }
+    } catch (e: any) {
+      console.error('createVendorAccount error:', e);
+      throw e;
+    }
   }
 
-  const updated = [...accounts, newAccount];
+  const updated = [
+    ...accounts.filter((a) => a.id !== newAccount.id && a.username.toLowerCase() !== newAccount.username.toLowerCase()),
+    newAccount,
+  ];
   safeStorage.set(STORAGE_KEYS.VENDOR_ACCOUNTS, updated);
   storeEvents.emit('vendor_accounts_updated', updated);
   return newAccount;
@@ -625,7 +774,11 @@ export const updateVendorAccount = async (
   accounts[index] = { ...accounts[index], ...updates };
 
   if (isSupabaseConfigured() && supabase) {
-    await supabase.from('vendor_accounts').update(updates).eq('id', id);
+    try {
+      await supabase.from('vendor_accounts').update(updates).eq('id', id);
+    } catch (e) {
+      console.warn('Supabase updateVendorAccount warning:', e);
+    }
   }
 
   safeStorage.set(STORAGE_KEYS.VENDOR_ACCOUNTS, accounts);
@@ -639,7 +792,11 @@ export const deleteVendorAccount = async (id: string): Promise<boolean> => {
   const updated = accounts.filter((a) => a.id !== id);
 
   if (isSupabaseConfigured() && supabase) {
-    await supabase.from('vendor_accounts').delete().eq('id', id);
+    try {
+      await supabase.from('vendor_accounts').delete().eq('id', id);
+    } catch (e) {
+      console.warn('Supabase deleteVendorAccount warning:', e);
+    }
   }
 
   safeStorage.set(STORAGE_KEYS.VENDOR_ACCOUNTS, updated);
